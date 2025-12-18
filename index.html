@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BRIGHT FUTURE - 3D 聖誕感官體驗</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;700&family=Great+Vibes&display=swap" rel="stylesheet">
+    
+    <!-- MediaPipe Hands SDK -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+    <style>
+        body, html { 
+            margin: 0; padding: 0; width: 100%; height: 100%; 
+            background: #000; overflow: hidden; color: #fff; 
+            font-family: 'Cinzel', serif;
+        }
+        #root { width: 100vw; height: 100vh; }
+        #gesture-video { 
+            position: absolute; width: 640px; height: 480px; 
+            left: -10000px; pointer-events: none; 
+        }
+        .select-none { user-select: none; }
+        
+        /* Glass UI */
+        .glass-ui {
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        .glass-ui:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        /* Wish Animation */
+        @keyframes float-ui {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(-10px); }
+        }
+        .animate-float { animation: float-ui 4s ease-in-out infinite; }
+    </style>
+
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom": "https://esm.sh/react-dom@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "three": "https://esm.sh/three@0.160.0",
+        "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.15.11",
+        "@react-three/drei": "https://esm.sh/@react-three/drei@9.88.16",
+        "@react-three/postprocessing": "https://esm.sh/@react-three/postprocessing@2.15.11"
+      }
+    }
+    </script>
+</head>
+<body>
+    <video id="gesture-video" autoplay muted playsinline></video>
+    <div id="root"></div>
+
+    <script type="module">
+        import React, { useState, useEffect, useRef, useMemo, useCallback, Suspense } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import * as THREE from 'three';
+        import { Canvas, useFrame } from '@react-three/fiber';
+        import { OrbitControls, PerspectiveCamera, Stars, Environment, Float, Sparkles } from '@react-three/drei';
+        import { EffectComposer, Bloom, Noise, Vignette } from '@react-three/postprocessing';
+
+        // --- 螺旋粒子聖誕樹組件 ---
+        const ChristmasTree = ({ handState, wishImpact }) => {
+            const pointsRef = useRef();
+            const total = 12000;
+            const scatter = useRef(0);
+            const pinch = useRef(0);
+            const rotation = useRef(0);
+            const wishBoost = useRef(1.0);
+
+            const [pos, tPos, col, sz] = useMemo(() => {
+                const p = new Float32Array(total * 3), tp = new Float32Array(total * 3), c = new Float32Array(total * 3), s = new Float32Array(total);
+                const colors = ['#ff00ff', '#ffd700', '#ffffff', '#9d00ff'].map(h => new THREE.Color(h));
+                for (let i = 0; i < total; i++) {
+                    const progress = i / total;
+                    const angle = progress * Math.PI * 16;
+                    const radius = (1 - progress) * 3.6;
+                    p[i*3] = Math.cos(angle) * radius; p[i*3+1] = progress * 8; p[i*3+2] = Math.sin(angle) * radius;
+                    
+                    const ga = Math.random() * Math.PI * 2, gd = 6 + Math.random() * 8;
+                    tp[i*3] = Math.cos(ga) * gd; tp[i*3+1] = (Math.random() - 0.5) * 0.5; tp[i*3+2] = Math.sin(ga) * gd;
+                    
+                    const sel = colors[Math.floor(Math.random() * colors.length)];
+                    c[i*3] = sel.r; c[i*3+1] = sel.g; c[i*3+2] = sel.b;
+                    s[i] = Math.random() * 0.14 + 0.04;
+                }
+                return [p, tp, c, s];
+            }, []);
+
+            const shader = useMemo(() => ({
+                uniforms: { uTime: { value: 0 }, uScatter: { value: 0 }, uPinch: { value: 0 }, uImpact: { value: 1.0 } },
+                vertexShader: `
+                    attribute vec3 targetPosition; attribute vec3 color; attribute float size;
+                    varying vec3 vColor; uniform float uTime; uniform float uScatter; uniform float uPinch;
+                    void main() {
+                        vColor = mix(color, vec3(1.0), uPinch);
+                        vec3 p = mix(position, targetPosition, uScatter);
+                        p.x += sin(uTime + p.y) * 0.05 * (1.0-uScatter);
+                        p.z += cos(uTime + p.y) * 0.05 * (1.0-uScatter);
+                        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+                        gl_PointSize = size * (1.0 + uPinch * 1.5) * (350.0 / -mv.z);
+                        gl_Position = projectionMatrix * mv;
+                    }`,
+                fragmentShader: `
+                    varying vec3 vColor; uniform float uImpact; uniform float uPinch;
+                    void main() {
+                        float d = distance(gl_PointCoord, vec2(0.5)); if (d > 0.5) discard;
+                        gl_FragColor = vec4(vColor * uImpact * (1.0 + uPinch * 5.0), 1.0 - d * 2.0);
+                    }`
+            }), []);
+
+            useFrame((state, delta) => {
+                if (!pointsRef.current) return;
+                const rotVel = handState.detected ? (handState.x - 0.5) * 8 : 0.3;
+                rotation.current += rotVel * delta;
+                pointsRef.current.rotation.y = rotation.current;
+
+                scatter.current = THREE.MathUtils.lerp(scatter.current, handState.isOpen ? 1 : 0, 0.06);
+                pinch.current = THREE.MathUtils.lerp(pinch.current, handState.isPinching ? 1 : 0, 0.1);
+                wishBoost.current = THREE.MathUtils.lerp(wishBoost.current, wishImpact ? 4 : 1.5, 0.1);
+
+                pointsRef.current.material.uniforms.uScatter.value = scatter.current;
+                pointsRef.current.material.uniforms.uPinch.value = pinch.current;
+                pointsRef.current.material.uniforms.uTime.value = state.clock.getElapsedTime();
+                pointsRef.current.material.uniforms.uImpact.value = wishBoost.current;
+            });
+
+            return (
+                <points ref={pointsRef}>
+                    <bufferGeometry>
+                        <bufferAttribute attach="attributes-position" count={total} array={pos} itemSize={3} />
+                        <bufferAttribute attach="attributes-targetPosition" count={total} array={tPos} itemSize={3} />
+                        <bufferAttribute attach="attributes-color" count={total} array={col} itemSize={3} />
+                        <bufferAttribute attach="attributes-size" count={total} array={sz} itemSize={1} />
+                    </bufferGeometry>
+                    <shaderMaterial args={[shader]} transparent depthWrite={false} blending={THREE.AdditiveBlending} />
+                </points>
+            );
+        };
+
+        // --- 頂部星星與 Hero Moment ---
+        const StarTopper = ({ handState, wishImpact }) => {
+            const group = useRef();
+            const star = useRef();
+            const [hero, setHero] = useState(false);
+
+            const starGeo = useMemo(() => {
+                const s = new THREE.Shape();
+                for (let i = 0; i < 10; i++) {
+                    const r = i % 2 === 0 ? 0.6 : 0.25;
+                    const a = (i * Math.PI) / 5 - Math.PI / 2;
+                    if (i === 0) s.moveTo(Math.cos(a)*r, Math.sin(a)*r); else s.lineTo(Math.cos(a)*r, Math.sin(a)*r);
+                }
+                return new THREE.ExtrudeGeometry(s, { depth: 0.15, bevelEnabled: true, bevelThickness: 0.05, bevelSize: 0.05 });
+            }, []);
+
+            useEffect(() => { if (wishImpact) { setHero(true); setTimeout(() => setHero(false), 3500); } }, [wishImpact]);
+
+            useFrame(() => {
+                if (!group.current) return;
+                const targetPos = hero ? new THREE.Vector3(0, -3, 7.5) : new THREE.Vector3(0, 0, 0);
+                const targetScale = handState.isOpen ? 0 : (hero ? 2.5 : 1);
+                group.current.position.lerp(targetPos, 0.1);
+                group.current.scale.setScalar(THREE.MathUtils.lerp(group.current.scale.x, targetScale, 0.1));
+                star.current.rotation.y += 0.03;
+                star.current.material.emissiveIntensity = hero ? 20 : 2;
+            });
+
+            return (
+                <group position={[0, 8.2, 0]} ref={group}>
+                    <mesh geometry={starGeo} ref={star}>
+                        <meshStandardMaterial color="#fff" emissive="#ffd700" emissiveIntensity={2} metalness={1} roughness={0} />
+                    </mesh>
+                    <pointLight intensity={hero ? 80 : 30} color="#ffd700" />
+                </group>
+            );
+        };
+
+        // --- 流星許願特效 ---
+        const ShootingStar = ({ onImpact }) => {
+            const ref = useRef();
+            const start = useRef(Date.now());
+            useFrame(() => {
+                const t = Math.min((Date.now() - start.current) / 2000, 1);
+                const a = t * Math.PI * 8, r = (1 - t) * 6, y = t * 9 - 1;
+                if (ref.current) ref.current.position.set(Math.cos(a)*r, y, Math.sin(a)*r);
+                if (t >= 1) onImpact();
+            });
+            return <mesh ref={ref}><sphereGeometry args={[0.2, 16, 16]} /><meshBasicMaterial color="#fff" /><pointLight intensity={40} color="#fff" /></mesh>;
+        };
+
+        // --- 主應用邏輯 ---
+        const App = () => {
+            const [loaded, setLoaded] = useState(false);
+            const [hand, setHand] = useState({ x: 0.5, isOpen: false, isPinching: false, detected: false });
+            const [modal, setModal] = useState(false);
+            const [wish, setWish] = useState({ active: false, impact: false });
+            const [toast, setToast] = useState(false);
+            const bloom = useRef({ intensity: 2.8 });
+
+            useEffect(() => {
+                setTimeout(() => setLoaded(true), 1000);
+                const video = document.getElementById('gesture-video');
+                const h = new window.Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+                h.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+                h.onResults(res => {
+                    if (res.multiHandLandmarks?.length > 0) {
+                        const m = res.multiHandLandmarks[0];
+                        const d = [m[8],m[12],m[16],m[20]].reduce((s,t)=>s+Math.sqrt(Math.pow(t.x-m[0].x,2)+Math.pow(t.y-m[0].y,2)),0)/4;
+                        const p = Math.sqrt(Math.pow(m[8].x-m[4].x,2)+Math.pow(m[8].y-m[4].y,2));
+                        setHand({ x: 1-m[8].x, isOpen: d > 0.42, isPinching: p < 0.065, detected: true });
+                    } else setHand(p=>({...p, detected: false}));
+                });
+                const c = new window.Camera(video, { onFrame: async () => { if(video.readyState >= 2) await h.send({image:video}); }, width: 640, height: 480 });
+                c.start();
+                return () => c.stop();
+            }, []);
+
+            const sendWish = () => { setModal(false); setWish({ active: true, impact: false }); };
+            const onImpact = useCallback(() => {
+                setWish({ active: false, impact: true });
+                bloom.current.intensity = 15;
+                setTimeout(() => { bloom.current.intensity = 2.8; setWish(p=>({...p, impact: false})); }, 3500);
+            }, []);
+
+            return (
+                <div className="relative w-full h-full bg-black select-none overflow-hidden">
+                    {/* UI: Top Left */}
+                    <div className={`fixed top-8 left-8 z-50 transition-all duration-1000 ${loaded ? 'opacity-100' : 'opacity-0 -translate-x-10'}`}>
+                        <div onClick={()=>window.open('#','_blank')} className="glass-ui px-6 py-4 rounded-2xl cursor-pointer group">
+                            <h1 className="text-white/95 font-bold text-lg tracking-widest">美景僱傭中心有限公司</h1>
+                            <p className="text-[8px] text-white/40 uppercase mt-1 tracking-tighter">BRIGHT FUTURE EMPLOYMENT CENTRE COMPANY LIMITED</p>
+                            <div className="w-0 group-hover:w-full h-[1px] bg-pink-500/50 mt-2 transition-all duration-500" />
+                        </div>
+                    </div>
+
+                    {/* UI: Top Right */}
+                    <div className={`fixed top-8 right-8 z-50 flex flex-col items-end gap-4 transition-all duration-1000 ${loaded ? 'opacity-100' : 'opacity-0'}`}>
+                        <button onClick={()=>{navigator.clipboard.writeText(window.location.href); setToast(true); setTimeout(()=>setToast(false),2000)}} className="w-12 h-12 glass-ui rounded-full flex items-center justify-center hover:scale-110 active:scale-90">
+                            <svg className="w-5 h-5 fill-white" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81 1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9c-1.66 0-3 1.34-3 3s1.34 3 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65 0 1.61 1.31 2.92 2.92 2.92 1.61 0 2.92-1.31 2.92-2.92s-1.31-2.92-2.92-2.92z"/></svg>
+                        </button>
+                        {hand.detected && <div className="text-right text-[9px] font-bold text-pink-400/80 tracking-widest animate-pulse">
+                            <p className={hand.isOpen ? 'opacity-100' : 'opacity-20'}>GALAXY MODE</p>
+                            <p className={hand.isPinching ? 'opacity-100' : 'opacity-20'}>ENERGY GATHER</p>
+                        </div>}
+                    </div>
+
+                    {/* Toast */}
+                    <div className={`fixed top-24 left-1/2 -translate-x-1/2 z-[60] glass-ui px-6 py-2 rounded-full text-[10px] tracking-widest transition-all ${toast ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>LINK COPIED!</div>
+
+                    {/* UI: Center Bottom */}
+                    <div className={`absolute bottom-20 inset-x-0 z-10 flex flex-col items-center pointer-events-none transition-all duration-[2s] ${loaded ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-10'}`}>
+                        <h2 className="font-['Great_Vibes'] text-8xl md:text-9xl text-white drop-shadow-[0_0_30px_rgba(255,20,147,0.4)]">merry Christmas</h2>
+                        <p className="text-[9px] text-white/20 tracking-[0.4em] uppercase mt-4">© 2025 BRIGHT FUTURE. All Rights Reserved.</p>
+                    </div>
+
+                    {/* Wish Button */}
+                    <button onClick={()=>setModal(true)} className={`fixed bottom-12 right-12 z-50 glass-ui px-10 py-4 rounded-full text-pink-100 font-bold tracking-widest hover:scale-105 active:scale-95 ${loaded ? 'opacity-100' : 'opacity-0'}`}>✨ MAKE A WISH</button>
+
+                    {/* Wish Modal */}
+                    {modal && <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-xl p-6">
+                        <div className="glass-ui w-full max-w-sm p-10 rounded-[2.5rem] animate-float">
+                            <h3 className="text-pink-100 text-2xl font-bold mb-6">Your Wish</h3>
+                            <textarea className="w-full h-32 bg-black/40 border border-white/10 rounded-2xl p-4 text-white focus:outline-none focus:border-pink-500/50 resize-none mb-8 text-sm" placeholder="Write down your wish..."></textarea>
+                            <div className="flex justify-end gap-6 text-[10px] font-bold">
+                                <button onClick={()=>setModal(false)} className="text-white/40 tracking-widest">CANCEL</button>
+                                <button onClick={sendWish} className="bg-gradient-to-br from-pink-600 to-rose-500 px-8 py-3 rounded-2xl text-white shadow-2xl">SEND WISH</button>
+                            </div>
+                        </div>
+                    </div>}
+
+                    <Canvas shadows dpr={[1, 2]}>
+                        <PerspectiveCamera makeDefault position={[0, 4, 16]} fov={38} />
+                        <Suspense fallback={null}>
+                            <group position={[0, -3.8, 0]}>
+                                <ChristmasTree handState={hand} wishImpact={wish.impact} />
+                                <StarTopper handState={hand} wishImpact={wish.impact} />
+                                {wish.active && <ShootingStar onImpact={onImpact} />}
+                                <Sparkles count={60} scale={[12, 10, 12]} size={2} color="#ffbde6" opacity={0.3} />
+                            </group>
+                            <Stars radius={120} depth={60} count={6000} factor={5} saturation={0.2} fade speed={1} />
+                            <Environment preset="night" />
+                            <EffectComposer disableNormalPass>
+                                <Bloom luminanceThreshold={0.1} mipmapBlur intensity={bloom.current.intensity} radius={0.7} />
+                                <Noise opacity={0.04} />
+                                <Vignette offset={0.3} darkness={1.2} />
+                            </EffectComposer>
+                        </Suspense>
+                        <OrbitControls enablePan={false} minDistance={12} maxDistance={28} maxPolarAngle={Math.PI/1.85} enableRotate={!hand.detected} />
+                    </Canvas>
+                </div>
+            );
+        };
+
+        createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
